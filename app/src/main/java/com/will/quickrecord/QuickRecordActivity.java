@@ -74,7 +74,6 @@ public final class QuickRecordActivity extends Activity
         implements LifecycleOwner, SensorEventListener {
     private static final int REQUEST_PERMISSIONS = 20;
     private static final long LIGHT_SAMPLE_MILLIS = 650L;
-    private static final long CAMERA_SETTLE_MILLIS = 450L;
 
     private final LifecycleRegistry lifecycleRegistry = new LifecycleRegistry(this);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -87,11 +86,14 @@ public final class QuickRecordActivity extends Activity
     private Sensor lightSensor;
     private Float measuredLux;
     private ProcessCameraProvider cameraProvider;
+    private Camera activeCamera;
     private VideoCapture<Recorder> videoCapture;
     private Recording activeRecording;
     private CaptureProfile activeProfile;
     private int configuredFps;
     private boolean cameraStarted;
+    private boolean lightProfileResolved;
+    private boolean torchObserverConfigured;
     private boolean stopping;
     private boolean awaitingFinalize;
     private boolean discardForList;
@@ -121,7 +123,7 @@ public final class QuickRecordActivity extends Activity
         lightSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
 
         if (hasCameraPermission()) {
-            beginLightSampling();
+            beginFastStartup();
         } else {
             ActivityCompat.requestPermissions(this, requiredPermissions(), REQUEST_PERMISSIONS);
         }
@@ -178,7 +180,7 @@ public final class QuickRecordActivity extends Activity
         root.setBackgroundColor(Color.BLACK);
 
         previewView = new PreviewView(this);
-        previewView.setImplementationMode(PreviewView.ImplementationMode.COMPATIBLE);
+        previewView.setImplementationMode(PreviewView.ImplementationMode.PERFORMANCE);
         previewView.setScaleType(PreviewView.ScaleType.FIT_CENTER);
         root.addView(previewView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -251,28 +253,19 @@ public final class QuickRecordActivity extends Activity
         setContentView(root);
     }
 
-    private void beginLightSampling() {
+    private void beginFastStartup() {
         if (cameraStarted) {
             return;
         }
         cameraStarted = true;
+        int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
+        activeProfile = CaptureProfile.choose(null, hour);
+        statusView.setText(activeProfile.label + " · 正在启动相机…");
+
         if (lightSensor != null) {
             sensorManager.registerListener(this, lightSensor, SensorManager.SENSOR_DELAY_NORMAL);
         }
-        mainHandler.postDelayed(this::chooseProfileAndOpenCamera, LIGHT_SAMPLE_MILLIS);
-    }
-
-    private void chooseProfileAndOpenCamera() {
-        if (discardForList || isFinishing()) {
-            return;
-        }
-        if (sensorManager != null) {
-            sensorManager.unregisterListener(this);
-        }
-        int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
-        activeProfile = CaptureProfile.choose(measuredLux, hour);
-        String lightText = measuredLux == null ? "按时间判断" : Math.round(measuredLux) + " lx";
-        statusView.setText(activeProfile.label + " · " + lightText + " · 正在启动相机…");
+        mainHandler.postDelayed(this::resolveLightProfile, LIGHT_SAMPLE_MILLIS);
 
         ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(this);
         future.addListener(() -> {
@@ -287,6 +280,29 @@ public final class QuickRecordActivity extends Activity
                 showStartError(firstError);
             }
         }, ContextCompat.getMainExecutor(this));
+    }
+
+    private void resolveLightProfile() {
+        if (lightProfileResolved || discardForList || isFinishing()) {
+            return;
+        }
+        lightProfileResolved = true;
+        if (sensorManager != null) {
+            sensorManager.unregisterListener(this);
+        }
+        int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
+        activeProfile = CaptureProfile.choose(measuredLux, hour);
+        if (activeCamera != null) {
+            applyLightControls(activeCamera, activeProfile);
+        }
+        if (activeRecording != null && !stopping) {
+            updateRecordingStatus(lastElapsedSeconds);
+        } else {
+            String lightText = measuredLux == null
+                    ? "按时间判断"
+                    : Math.round(measuredLux) + " lx";
+            statusView.setText(activeProfile.label + " · " + lightText + " · 正在启动相机…");
+        }
     }
 
     private void bindCamera(CaptureProfile profile) {
@@ -322,14 +338,14 @@ public final class QuickRecordActivity extends Activity
                 .setTargetFrameRate(new Range<>(30, 30));
         videoCapture = captureBuilder.build();
 
-        Camera camera = cameraProvider.bindToLifecycle(
+        activeCamera = cameraProvider.bindToLifecycle(
                 this,
                 CameraSelector.DEFAULT_BACK_CAMERA,
                 preview,
                 videoCapture);
         configuredFps = 30;
-        tuneForLicensePlate(camera, profile);
-        mainHandler.postDelayed(this::startRecording, CAMERA_SETTLE_MILLIS);
+        startRecording();
+        tuneForLicensePlate(activeCamera, profile);
     }
 
     private int targetRotation() {
@@ -339,20 +355,11 @@ public final class QuickRecordActivity extends Activity
     }
 
     private void tuneForLicensePlate(Camera camera, CaptureProfile profile) {
-        configureAutomaticTorch(camera, profile);
+        applyLightControls(camera, profile);
 
         ZoomState zoomState = camera.getCameraInfo().getZoomState().getValue();
         if (zoomState != null && zoomState.getMinZoomRatio() <= 1f && zoomState.getMaxZoomRatio() >= 1f) {
             camera.getCameraControl().setZoomRatio(1f);
-        }
-
-        androidx.camera.core.ExposureState exposure = camera.getCameraInfo().getExposureState();
-        if (exposure.isExposureCompensationSupported()) {
-            Rational step = exposure.getExposureCompensationStep();
-            int index = Math.round(profile.exposureEv / step.floatValue());
-            Range<Integer> range = exposure.getExposureCompensationRange();
-            index = Math.max(range.getLower(), Math.min(range.getUpper(), index));
-            camera.getCameraControl().setExposureCompensationIndex(index);
         }
 
         previewView.post(() -> {
@@ -371,20 +378,35 @@ public final class QuickRecordActivity extends Activity
         });
     }
 
+    private void applyLightControls(Camera camera, CaptureProfile profile) {
+        configureAutomaticTorch(camera, profile);
+
+        androidx.camera.core.ExposureState exposure = camera.getCameraInfo().getExposureState();
+        if (exposure.isExposureCompensationSupported()) {
+            Rational step = exposure.getExposureCompensationStep();
+            int index = Math.round(profile.exposureEv / step.floatValue());
+            Range<Integer> range = exposure.getExposureCompensationRange();
+            index = Math.max(range.getLower(), Math.min(range.getUpper(), index));
+            camera.getCameraControl().setExposureCompensationIndex(index);
+        }
+    }
+
     private void configureAutomaticTorch(Camera camera, CaptureProfile profile) {
         hasFlashUnit = camera.getCameraInfo().hasFlashUnit();
-        torchEnabled = false;
         torchRequestFailed = false;
         if (!hasFlashUnit) {
             return;
         }
 
-        camera.getCameraInfo().getTorchState().observe(this, torchState -> {
-            torchEnabled = torchState != null && torchState == TorchState.ON;
-            if (activeRecording != null && !stopping) {
-                updateRecordingStatus(lastElapsedSeconds);
-            }
-        });
+        if (!torchObserverConfigured) {
+            torchObserverConfigured = true;
+            camera.getCameraInfo().getTorchState().observe(this, torchState -> {
+                torchEnabled = torchState != null && torchState == TorchState.ON;
+                if (activeRecording != null && !stopping) {
+                    updateRecordingStatus(lastElapsedSeconds);
+                }
+            });
+        }
 
         ListenableFuture<Void> torchRequest = camera.getCameraControl()
                 .enableTorch(profile.enableTorch);
@@ -392,7 +414,7 @@ public final class QuickRecordActivity extends Activity
             try {
                 torchRequest.get();
             } catch (Exception error) {
-                torchRequestFailed = true;
+                torchRequestFailed = profile.enableTorch;
                 if (activeRecording != null && !stopping) {
                     updateRecordingStatus(lastElapsedSeconds);
                 }
@@ -499,11 +521,11 @@ public final class QuickRecordActivity extends Activity
         if (!hasFlashUnit) {
             return "无补光灯";
         }
-        if (torchRequestFailed) {
-            return "补光失败";
-        }
         if (!activeProfile.enableTorch) {
             return "补光关";
+        }
+        if (torchRequestFailed) {
+            return "补光失败";
         }
         return torchEnabled ? "补光开" : "补光启动中";
     }
@@ -608,7 +630,7 @@ public final class QuickRecordActivity extends Activity
             return;
         }
         if (hasCameraPermission()) {
-            beginLightSampling();
+            beginFastStartup();
         } else {
             Toast.makeText(this, R.string.camera_permission_required, Toast.LENGTH_LONG).show();
             finish();
@@ -637,6 +659,7 @@ public final class QuickRecordActivity extends Activity
     public void onSensorChanged(SensorEvent event) {
         if (event.sensor.getType() == Sensor.TYPE_LIGHT && event.values.length > 0) {
             measuredLux = event.values[0];
+            resolveLightProfile();
         }
     }
 

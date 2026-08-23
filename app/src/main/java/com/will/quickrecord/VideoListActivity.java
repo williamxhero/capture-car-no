@@ -17,6 +17,7 @@ import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.Editable;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.util.Size;
 import android.view.Gravity;
@@ -36,8 +37,10 @@ import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -49,6 +52,9 @@ public final class VideoListActivity extends Activity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService thumbnailExecutor = Executors.newFixedThreadPool(2);
     private final ExecutorService deletionExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService recognitionExecutor = Executors.newSingleThreadExecutor();
+    private final Set<Long> recognizingVideoIds = new HashSet<>();
+    private final Set<Long> deletingVideoIds = new HashSet<>();
 
     private LinearLayout rowsContainer;
     private TextView summaryView;
@@ -85,6 +91,7 @@ public final class VideoListActivity extends Activity {
     protected void onDestroy() {
         thumbnailExecutor.shutdownNow();
         deletionExecutor.shutdownNow();
+        recognitionExecutor.shutdownNow();
         mainHandler.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
@@ -219,6 +226,9 @@ public final class VideoListActivity extends Activity {
         }
         setDeleteAllEnabled(false);
         summaryView.setText("正在彻底删除…");
+        for (VideoEntry video : videosToDelete) {
+            deletingVideoIds.add(video.id);
+        }
         deletionExecutor.execute(() -> {
             int deleted = 0;
             SharedPreferences.Editor annotationEditor = platePreferences.edit();
@@ -226,6 +236,7 @@ public final class VideoListActivity extends Activity {
                 try {
                     if (getContentResolver().delete(video.uri, null, null) > 0) {
                         annotationEditor.remove(plateKey(video.id));
+                        annotationEditor.remove(scanKey(video.id));
                         deleted++;
                     }
                 } catch (RuntimeException ignored) {
@@ -236,6 +247,7 @@ public final class VideoListActivity extends Activity {
             int deletedCount = deleted;
             int failedCount = videosToDelete.size() - deleted;
             mainHandler.post(() -> {
+                deletingVideoIds.clear();
                 if (failedCount == 0) {
                     Toast.makeText(this,
                             "已彻底删除 " + deletedCount + " 段录像",
@@ -323,8 +335,10 @@ public final class VideoListActivity extends Activity {
 
         EditText plate = new EditText(this);
         plate.setSingleLine(true);
-        plate.setHint("点击录入");
-        plate.setText(platePreferences.getString(plateKey(video.id), ""));
+        String storedPlate = platePreferences.getString(plateKey(video.id), "");
+        boolean scanComplete = platePreferences.getBoolean(scanKey(video.id), false);
+        plate.setHint(storedPlate.isEmpty() && !scanComplete ? "正在识别…" : "点击录入");
+        plate.setText(storedPlate);
         plate.setTextColor(Color.WHITE);
         plate.setHintTextColor(0xFF777777);
         plate.setTextSize(17f);
@@ -362,12 +376,55 @@ public final class VideoListActivity extends Activity {
         plateParams.leftMargin = dp(8);
         row.addView(plate, plateParams);
 
+        if (storedPlate.isEmpty() && !scanComplete) {
+            schedulePlateRecognition(video, plate);
+        }
+
         LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(88));
         rowParams.bottomMargin = dp(8);
         row.setLayoutParams(rowParams);
         return row;
+    }
+
+    private void schedulePlateRecognition(VideoEntry video, EditText target) {
+        if (recognizingVideoIds.contains(video.id) || deletingVideoIds.contains(video.id)) {
+            return;
+        }
+        recognizingVideoIds.add(video.id);
+        recognitionExecutor.execute(() -> {
+            PlateRecognizer.Result result = PlateRecognizer.recognize(this, video.uri);
+            mainHandler.post(() -> {
+                recognizingVideoIds.remove(video.id);
+                if (isDestroyed() || deletingVideoIds.contains(video.id)) {
+                    return;
+                }
+                if (!result.completed) {
+                    if (target.isAttachedToWindow() && target.getText().length() == 0) {
+                        target.setHint("点击录入");
+                    }
+                    return;
+                }
+
+                String existing = platePreferences.getString(plateKey(video.id), "").trim();
+                String recognized = TextUtils.join("、", result.plates);
+                SharedPreferences.Editor editor = platePreferences.edit()
+                        .putBoolean(scanKey(video.id), true);
+                if (existing.isEmpty() && !recognized.isEmpty()) {
+                    editor.putString(plateKey(video.id), recognized);
+                }
+                editor.apply();
+
+                if (target.isAttachedToWindow() && target.getText().length() == 0) {
+                    if (!recognized.isEmpty()) {
+                        target.setText(recognized);
+                    } else {
+                        target.setHint("点击录入");
+                    }
+                }
+            });
+        });
     }
 
     private void loadThumbnail(VideoEntry video, ImageView target) {
@@ -413,6 +470,10 @@ public final class VideoListActivity extends Activity {
 
     private String plateKey(long videoId) {
         return "plate_" + videoId;
+    }
+
+    private String scanKey(long videoId) {
+        return "plate_scan_" + videoId;
     }
 
     private GradientDrawable roundedBackground(int color, int radiusDp) {
