@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">车牌录像</string>
+    <string name="camera_permission_required">需要相机权限才能录像</string>
+    <string name="camera_start_failed">相机启动失败</string>
+    <string name="recording_failed">录像未能保存</string>
+</resources>
